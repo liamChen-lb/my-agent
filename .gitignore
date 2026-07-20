@@ -1,0 +1,6 @@
+/var/
+/.env
+/.idea/
+/.DS_Store
+vendor/
+/.cursor/

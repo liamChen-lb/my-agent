@@ -1,0 +1,20 @@
+{
+  "name": "demo/php-llm-agent",
+  "description": "A framework-free PHP implementation for teaching LLM Agent internals.",
+  "license": "proprietary",
+  "type": "project",
+  "require": {
+    "php": ">=8.2",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "DemoAgent\\": "src/"
+    }
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
