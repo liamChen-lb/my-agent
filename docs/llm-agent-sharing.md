@@ -27,7 +27,7 @@ mindmap
     Agent 系统层 补偿控制与执行
       Context Engineering
         上下文选择与装配
-        RAG 与 Memory
+        Memory 与非参数化持续学习
         压缩 缓存与 Sub-agent
       工具运行时
         Function Calling
@@ -45,6 +45,7 @@ mindmap
     应用实践层 真正落地
       产品形态演进
         Web Chat 与 IDE
+        OpenClaw 与 Hermes
         OS 具身与分布式 Agent
       PHP 递进实现
         00 到 06 教学脚本
@@ -146,9 +147,9 @@ flowchart LR
 
 自回归生成可写成：
 
-$$
-P(x_{1:n})=\prod_{t=1}^{n}P(x_t \mid x_{<t}, C)
-$$
+![自回归语言模型的概率分解公式](assets/llm-autoregressive-factorization.png)
+
+> LaTeX 源码：`P(x_{1:n})=\prod_{t=1}^{n}P(x_t \mid x_{<t}, C)`。其中 `C` 表示本次推理额外提供的上下文。
 
 模型每一步根据已有 Token 和 Context，计算下一个 Token 的概率分布，再按解码策略选取输出。`temperature` 调整分布的随机性，但不是“聪明程度”旋钮。
 
@@ -445,6 +446,113 @@ flowchart TB
 - Prompt Injection 被记忆并长期复现。
 
 “会成长的 Agent”可能更新外部记忆、SOP、Skill 或路由策略；若不改模型权重，就不应表述为“模型自己学习成了新模型”。“角色扮演”只能解释其中一部分，真实系统还包含持久化、检索、评价和更新策略。
+
+#### 4.4.1 参数化与非参数化持续学习
+
+大模型持续学习至少要区分三条路线：
+
+1. **参数化持续学习**：通过继续预训练、Fine-tuning、LoRA、Adapter 或在线梯度更新，把新知识写入模型参数。优点是推理时可以直接利用；难点是训练成本、灾难性遗忘、知识冲突、更新验证和删除困难；
+2. **非参数化持续学习**：保持主模型参数不变，把新事实、经历、策略和用户偏好写入外部可更新 Memory，推理时按需检索进 Active Context；
+3. **半参数化/混合路线**：外部 Memory 负责快速、可审计的更新，周期性训练再把经过验证的稳定模式蒸馏进模型、Retriever 或 Policy。
+
+这里的“非参数化”不表示系统里没有任何参数化模型：Embedding、Reranker、摘要模型和决策模型仍可能有参数。它强调的是：**新知识没有通过梯度更新写进基础 LLM 权重，而是保存在可读写、可检索、可删除的外部状态中。**
+
+#### 4.4.2 非参数化持续学习的闭环
+
+```mermaid
+flowchart LR
+    subgraph Capture["1. 感知、提取与写入"]
+        direction TB
+        X[交互 / 工具轨迹 / 环境反馈] --> E[提取候选记忆]
+        E --> G{写入门禁}
+        G -->|低价值 / 不可信 / 敏感| D[丢弃或等待人工确认]
+        G -->|通过| EP[Episodic<br/>发生过什么]
+        G -->|通过| SE[Semantic<br/>事实与用户模型]
+        G -->|通过| PR[Procedural<br/>Skill / SOP / Policy]
+    end
+
+    subgraph Maintain["2. 外部 Memory 的组织与维护"]
+        direction TB
+        EP --> O[索引 / 关联 / 去重 / 版本化]
+        SE --> O
+        PR --> O
+        O --> K[巩固 / 合并 / 纠错 / 遗忘]
+    end
+
+    subgraph Use["3. 检索、行动与反馈"]
+        direction TB
+        K --> R[按当前目标检索与重排]
+        R --> C[注入 Active Context]
+        C --> A[模型决策与 Agent 行动]
+        A --> V[结果验证和用户反馈]
+        V --> F[进入下一轮候选写入与冲突修订]
+    end
+```
+
+真正的持续学习闭环不只是 `store → search`，还需要：
+
+- **Write policy**：什么值得记、由谁确认、记录事实还是记录推测；
+- **Representation**：文本、向量、结构化槽位、时序图或知识图谱；
+- **Consolidation / Reconsolidation**：合并重复经历、形成更高层规律，并在新证据出现时修订旧记忆；
+- **Retrieval policy**：何时检索、取多少、怎样处理时间、来源和矛盾；
+- **Forgetting / Deletion**：过期淘汰、用户删除权、租户隔离和机器遗忘接口；
+- **Evaluation**：不仅测召回率，还要测长期任务成功率、错误记忆传播、知识更新、跨会话一致性和成本。
+
+#### 4.4.3 从 RAG 到 Memory
+
+RAG 和非参数化持续学习有共同的“外部存储 + 检索”结构，但关注点不同：
+
+- 传统 RAG 往往面对相对静态的文档库，重点是切分、召回、精排和有依据生成；
+- Agent Memory 必须持续写入交互经验，处理时间、身份、来源、冲突、巩固和遗忘；
+- RAG 主要解决“这次回答需要哪些资料”，持续学习还要回答“这次经历是否应改变未来行为”；
+- 因此，给 RAG 增加一个自动写入接口不等于已经解决持续学习。
+
+HippoRAG 2 将 RAG 明确放到“非参数化持续学习”框架下，用图结构和 Personalized PageRank 改善事实、sense-making 与关联记忆。A-MEM 则借鉴 Zettelkasten，把记忆组织成可动态建立链接、随新证据演化的原子笔记网络。两者都说明研究重点正在从“把文档检索回来”转向“怎样长期组织、更新和利用经验”。
+
+#### 4.4.4 OpenClaw 与 Hermes Agent：成长发生在 Harness 层
+
+2026 年的代表性 Agent 产品 OpenClaw 和 Hermes Agent 都把“成长”实现为模型外部状态和流程的演化，而不是每次会话都重新训练基础模型。
+
+**OpenClaw**
+
+- 通过 `memory_search`、`memory_get` 等工具访问持久化 Memory，并可使用向量与关键词混合检索；
+- 日常记录和短期信号可以被整理进长期 `MEMORY.md`；
+- 官方 Dreaming 机制按 light → REM → deep 三个阶段做后台巩固：筛选候选、反思主题、把达到门槛的内容提升为长期记忆；
+- 巩固过程包含来源、频率、多样性和不可信内容门禁，并把可读摘要写入 `DREAMS.md` 供人检查；
+- 模型参数没有因此改变；变化的是 Memory 文件、索引、巩固状态和未来 Prompt。
+
+**Hermes Agent**
+
+- 使用持久化 `MEMORY.md`、`USER.md` 保存事实、偏好和用户模型，并在会话开始时注入有界快照；
+- 使用 `skill_manage` 创建、更新和删除程序性 Skills，把复杂工作流沉淀成可复用 `SKILL.md`；
+- 后台 self-improvement review 可以在主回答结束后，从轨迹中提取耐久事实或改进 Skill，避免与当前用户任务争夺注意力；
+- Memory 和 Skill 写入可开启 approval gate，先暂存变更，再由用户批准或拒绝；
+- 这类“自我改进”仍属于可检查的外部 Memory / Skill 学习，不等于 Hermes 底层模型权重持续更新。
+
+两者共同呈现出一个产品化趋势：
+
+```text
+会话轨迹
+  → 后台评价与筛选
+  → 事实写入 Memory
+  → 流程沉淀为 Skill
+  → 下一次按需检索和加载
+  → 根据新反馈继续修订
+```
+
+宣传中的“越来越懂你”只有在写入准确、召回相关、冲突可修复、删除可执行且长期任务指标改善时才成立；Memory 变多本身不等于 Agent 变好。
+
+#### 4.4.5 可展开的研究问题
+
+“大模型非参数化持续学习”可以沿以下主线展开：
+
+1. **记忆形成**：怎样从自然语言、工具轨迹和环境反馈中提取可复用知识，同时控制误写和隐私；
+2. **动态组织**：怎样在向量、图、事件流、用户模型和程序性 Skill 之间选择或自适应路由；
+3. **巩固与遗忘**：怎样合并、抽象、版本化、纠错和安全删除，避免 Memory 无限增长；
+4. **可学习的读写策略**：用规则、LLM、强化学习或小模型决定何时写、何时读、读什么；
+5. **长期评测**：从静态 QA 转向跨会话、持续变化环境中的 retention、adaptation、transfer 和 task success；
+6. **可信持续学习**：处理 Prompt Injection、错误经验自增强、跨用户污染、来源追踪和人类审批；
+7. **Memory 到参数的蒸馏**：何时把稳定外部知识周期性转成模型或 Policy 更新，同时保留审计和回滚能力。
 
 ### 4.5 Sub-agent 也是 Context 隔离手段
 
@@ -1107,7 +1215,7 @@ Ollama 报告该本地模型为 36.0B 参数、GGUF Q4_K_M、23 GB，架构族�
 4. **10 分钟：Agent loop、规划与委派**
    对比 ReAct、Plan-and-Execute 和隔离 Context 的 Sub-agent。
 5. **10 分钟：现代 Context Engineering**
-   RAG、Tool clearing、摘要、Memory、Prompt Cache 和 Skills。
+   从 RAG、Memory 到非参数化持续学习，并用 OpenClaw、Hermes 说明外部记忆、巩固和 Skills 演化。
 6. **10 分钟：两个完整演示**
    Salora MCP 只读查询；`load_skill → MCP spec → write_file → MCP validate → 浏览器打开`。
 7. **3 分钟：安全、成本与结论**。
@@ -1143,32 +1251,39 @@ Ollama 报告该本地模型为 36.0B 参数、GGUF Q4_K_M、23 GB，架构族�
 11. *Active Context Compression: Autonomous Memory Management in LLM Agents* (2026): https://arxiv.org/abs/2601.07190
 12. *Parallel Context Compaction for Long-Horizon LLM Agent Serving* (2026): https://arxiv.org/abs/2605.23296
 13. Anthropic, *Effective context engineering for AI agents*: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+14. Gutiérrez et al., *From RAG to Memory: Non-Parametric Continual Learning for Large Language Models / HippoRAG 2* (2025): https://arxiv.org/abs/2502.14802
+15. Xu et al., *A-MEM: Agentic Memory for LLM Agents* (NeurIPS 2025): https://arxiv.org/abs/2502.12110
+16. OpenClaw, *Memory*: https://docs.openclaw.ai/concepts/memory/
+17. OpenClaw, *Dreaming*: https://docs.openclaw.ai/concepts/dreaming
+18. Nous Research, *Hermes Agent*: https://github.com/NousResearch/hermes-agent
+19. Hermes Agent, *Persistent Memory*: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
+20. Hermes Agent, *Skills System*: https://hermes-agent.nousresearch.com/docs/user-guide/features/skills
 
 ### 协议、Skills 与缓存
 
-14. OpenAI, *Chat Completions API Reference*: https://platform.openai.com/docs/api-reference/chat
-15. Anthropic, *Messages API Reference*: https://docs.anthropic.com/en/api/messages
-16. OpenAI, *Migrate to the Responses API*: https://developers.openai.com/api/docs/guides/migrate-to-responses
-17. OpenAI, *Conversation state*: https://developers.openai.com/api/docs/guides/conversation-state
-18. Model Context Protocol, *Tools Specification*: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
-19. Model Context Protocol Specification: https://modelcontextprotocol.io/specification/2025-11-25
-20. CRMCN-12455, *Salora API 转 AI Tool / MCP 技术方案*: https://thebidgroup.atlassian.net/browse/CRMCN-12455
-21. CRMCN-12467, *Salora API 操作权限与数据权限审计*: https://thebidgroup.atlassian.net/browse/CRMCN-12467
-22. Agent Skills 开放规范: https://agentskills.io/home
-23. Anthropic, *Equipping agents for the real world with Agent Skills*: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
-24. OpenAI, *Prompt Caching*: https://developers.openai.com/api/docs/guides/prompt-caching
+21. OpenAI, *Chat Completions API Reference*: https://platform.openai.com/docs/api-reference/chat
+22. Anthropic, *Messages API Reference*: https://docs.anthropic.com/en/api/messages
+23. OpenAI, *Migrate to the Responses API*: https://developers.openai.com/api/docs/guides/migrate-to-responses
+24. OpenAI, *Conversation state*: https://developers.openai.com/api/docs/guides/conversation-state
+25. Model Context Protocol, *Tools Specification*: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+26. Model Context Protocol Specification: https://modelcontextprotocol.io/specification/2025-11-25
+27. CRMCN-12455, *Salora API 转 AI Tool / MCP 技术方案*: https://thebidgroup.atlassian.net/browse/CRMCN-12455
+28. CRMCN-12467, *Salora API 操作权限与数据权限审计*: https://thebidgroup.atlassian.net/browse/CRMCN-12467
+29. Agent Skills 开放规范: https://agentskills.io/home
+30. Anthropic, *Equipping agents for the real world with Agent Skills*: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+31. OpenAI, *Prompt Caching*: https://developers.openai.com/api/docs/guides/prompt-caching
 
 ### 可继续参考的开源实现
 
-25. Datawhale, *hello-agents*: https://github.com/datawhalechina/hello-agents
-26. *ai-agents-from-zero*: https://github.com/didilili/ai-agents-from-zero
-27. *learn-claude-code*: https://github.com/shareAI-lab/learn-claude-code
-28. Anthropic, *claude-code*: https://github.com/anthropics/claude-code
-29. *free-claude-code*: https://github.com/Alishahryar1/free-claude-code
-30. Petroni et al., *Language Models as Knowledge Bases?* (2019): https://arxiv.org/abs/1909.01066
-31. OpenAI, *Function Calling*: https://platform.openai.com/docs/guides/function-calling
-32. Anthropic, *Building effective agents* (2024): https://www.anthropic.com/engineering/building-effective-agents
-33. Packer et al., *MemGPT: Towards LLMs as Operating Systems* (2023): https://arxiv.org/abs/2310.08560
-34. Anthropic, *How we built our multi-agent research system* (2025): https://www.anthropic.com/engineering/multi-agent-research-system
+32. Datawhale, *hello-agents*: https://github.com/datawhalechina/hello-agents
+33. *ai-agents-from-zero*: https://github.com/didilili/ai-agents-from-zero
+34. *learn-claude-code*: https://github.com/shareAI-lab/learn-claude-code
+35. Anthropic, *claude-code*: https://github.com/anthropics/claude-code
+36. *free-claude-code*: https://github.com/Alishahryar1/free-claude-code
+37. Petroni et al., *Language Models as Knowledge Bases?* (2019): https://arxiv.org/abs/1909.01066
+38. OpenAI, *Function Calling*: https://platform.openai.com/docs/guides/function-calling
+39. Anthropic, *Building effective agents* (2024): https://www.anthropic.com/engineering/building-effective-agents
+40. Packer et al., *MemGPT: Towards LLMs as Operating Systems* (2023): https://arxiv.org/abs/2310.08560
+41. Anthropic, *How we built our multi-agent research system* (2025): https://www.anthropic.com/engineering/multi-agent-research-system
 
 论文版本、API 行为和价格会变化；正式分享前应再次检查链接、修订日期和供应商文档。

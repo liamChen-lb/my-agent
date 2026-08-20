@@ -786,6 +786,38 @@ $recalled = $memory->search($task, 3);
 
 `AgentSession::clear()` 只重置活跃消息数组。Memory 在磁盘中，生命周期独立，所以帮助文本明确写着“不删除外部 Memory”。
 
+### 11.5 当前实现不是完整的非参数化持续学习
+
+当前 `MemoryStore` 只实现教学所需的最小 `remember/search`：
+
+- 没有 Embedding、Reranker 或知识图谱；
+- 没有事实/经历/程序性记忆的类型化存储；
+- 没有写入评价、来源可信度和人工审批；
+- 没有去重、冲突检测、巩固、遗忘和版本回滚；
+- 不会根据任务成败自动更新 Skill 或路由策略；
+- 没有长期、多会话评测。
+
+因此可以说它展示了非参数化持续学习的基本数据通路，但不能说项目已经实现“会自我成长”的完整 Agent。
+
+### 11.6 OpenClaw、Hermes 与后续研究方向
+
+OpenClaw 和 Hermes Agent 展示了更完整的 Harness 层学习：
+
+- OpenClaw 使用可检索 Memory、后台 Dreaming 巩固和可审阅的长期 `MEMORY.md`；
+- Hermes 使用持久化事实/用户模型、后台 self-improvement review 和可自动演化但支持人工审批的 Skills；
+- 两者主要更新外部状态和程序性知识，不代表基础 LLM 权重在会话中发生在线训练。
+
+若基于当前项目继续研究“大模型非参数化持续学习”，最自然的增量顺序是：
+
+1. 为 Memory 增加稳定 ID、来源、时间、租户、置信度和版本；
+2. 把 write policy 从“模型主动调用 remember”升级为可评价、可审批的写入管线；
+3. 引入语义/图检索和时间、冲突、关联感知的 Reranker；
+4. 增加后台 consolidation，把重复经历沉淀为事实或 Skill；
+5. 增加 supersede、forget、delete 和审计日志；
+6. 建立跨会话任务集，评估 retention、adaptation、transfer、错误传播和成本。
+
+这部分属于研究和后续实现方向，不应混入当前项目的已完成功能清单。
+
 ## 12. Skills
 
 ### 12.1 目录约定
