@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 require dirname(__DIR__) . '/bootstrap.php';
 
+use DemoAgent\Agent\SubAgentManager;
 use DemoAgent\Cli\DemoOptions;
 use DemoAgent\Cli\TerminalInput;
 use DemoAgent\Context\ContextManager;
 use DemoAgent\Llm\LlmClient;
+use DemoAgent\Mcp\HttpMcpClient;
 use DemoAgent\Mcp\McpClient;
 use DemoAgent\Memory\MemoryStore;
 use DemoAgent\Observability\TranscriptLogger;
@@ -142,6 +144,48 @@ $test('项目级工具支持搜索、精确编辑和命令执行', static functi
     ]), true);
     $assert(($command['exit_code'] ?? -1) === 0);
     $assert(($command['stdout'] ?? '') === '42');
+});
+
+$test('只读工具集不会向 Sub-agent 暴露写入、编辑或 Shell', static function () use ($runtime, $logger, $assert): void {
+    $registry = new ToolRegistry($logger);
+    WorkspaceTools::register($registry, $runtime, writeEnabled: false);
+    DeveloperTools::register(
+        $registry,
+        $runtime,
+        static fn (string $_command): bool => false,
+        shellEnabled: false,
+        editEnabled: false,
+    );
+    $names = array_map(
+        static fn (array $schema): string => (string) ($schema['function']['name'] ?? ''),
+        $registry->schemas(),
+    );
+    $assert(in_array('list_files', $names, true));
+    $assert(in_array('read_file', $names, true));
+    $assert(in_array('search_files', $names, true));
+    $assert(!in_array('write_file', $names, true));
+    $assert(!in_array('edit_file', $names, true));
+    $assert(!in_array('run_command', $names, true));
+});
+
+$test('Sub-agent 注册隔离委派工具和两种权限模式', static function () use ($runtime, $logger, $assert): void {
+    $llm = new LlmClient('http://127.0.0.1', 'unused', 'mock', $logger);
+    $registry = new ToolRegistry($logger);
+    $subAgents = new SubAgentManager($llm, $runtime, maxSteps: 2, maxInvocations: 1);
+    $subAgents->registerTool($registry);
+    $schema = $registry->schemas()[0]['function'] ?? [];
+    $assert(($schema['name'] ?? null) === 'delegate_task');
+    $assert(($schema['parameters']['properties']['mode']['enum'] ?? null) === ['research', 'workspace']);
+    $assert(($schema['parameters']['additionalProperties'] ?? null) === false);
+});
+
+$test('HTTP MCP Client 拒绝非 HTTP transport', static function () use ($logger, $assert): void {
+    try {
+        new HttpMcpClient('file:///tmp/mcp.sock', [], $logger);
+        $assert(false, '应拒绝 file transport');
+    } catch (InvalidArgumentException $error) {
+        $assert(str_contains($error->getMessage(), 'http'));
+    }
 });
 
 $test('Skill 只预加载元数据并可按需加载正文', static function () use ($logger, $assert): void {

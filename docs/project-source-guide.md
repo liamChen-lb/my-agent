@@ -33,8 +33,9 @@ bin/*                         负责装配和启动
   ├─ LlmFactory              根据环境创建 LlmClient 和日志器
   ├─ ToolRegistry            把各种能力统一成 Function Calling 工具
   ├─ AgentLoop/AgentSession  驱动“模型 → 工具 → observation”循环
+  ├─ SubAgentManager         用独立 messages 和受限工具执行同步委派
   ├─ ContextManager          控制活跃上下文体积
-  └─ MCP / Skills / Memory   给 Agent 增加协议、程序性知识和长期状态
+  └─ MCP / Skills / Memory   给 Agent 增加 stdio/HTTP 协议、程序性知识和长期状态
 ```
 
 ### 1.1 模型和程序各自负责什么
@@ -68,9 +69,11 @@ PHP runtime 负责：
 - 文件读取、写入、搜索、精确编辑；
 - 经过用户批准的 Shell 命令；
 - stdio MCP 工具发现和调用；
+- Streamable HTTP MCP 工具发现和调用，可通过 Header 注入用户凭据；
 - Skill 元数据预载、正文按需加载；
 - 文件型长期 Memory；
 - 旧工具输出清理和 LLM 摘要压缩；
+- 同步 Sub-agent 委派、独立消息历史、只读/工作区两种权限模式；
 - JSONL 全链路日志与 Token/耗时指标；
 - DeepSeek/Ollama 双 profile 对比；
 - 交互式 Coding Agent CLI。
@@ -80,7 +83,7 @@ PHP runtime 负责：
 不要把分享材料里的所有概念都说成仓库已经实现：
 
 - 没有向量数据库、Embedding、Reranker 或完整 RAG；
-- 没有真正的并行 sub-agent；
+- Sub-agent 当前同步执行，没有并行调度、取消、跨进程隔离或独立模型路由；
 - 没有流式输出；
 - 没有 Web UI；
 - 没有权限沙箱、容器隔离或操作系统级安全边界；
@@ -108,7 +111,8 @@ my-agent/
 ├── src/
 │   ├── Agent/
 │   │   ├── AgentLoop.php         一次任务、一次进程的循环
-│   │   └── AgentSession.php      跨用户轮次保留历史的循环
+│   │   ├── AgentSession.php      跨用户轮次保留历史的循环
+│   │   └── SubAgentManager.php   隔离消息、受限工具和同步委派
 │   ├── Cli/
 │   │   ├── DemoOptions.php       00-06 共用 --profile 与任务参数
 │   │   └── TerminalInput.php     TTY、Readline、中文退格和降级输入
@@ -118,7 +122,9 @@ my-agent/
 │   │   ├── LlmClient.php         HTTP 请求、响应解析、指标
 │   │   └── LlmFactory.php        profile、日志与环境配置装配
 │   ├── Mcp/
-│   │   └── McpClient.php         stdio JSON-RPC MCP Client
+│   │   ├── McpClient.php         stdio JSON-RPC MCP Client
+│   │   ├── HttpMcpClient.php     Streamable HTTP JSON/SSE MCP Client
+│   │   └── SaloraMcpConnector.php 环境配置到 Salora Tool Registry
 │   ├── Memory/
 │   │   ├── MemoryStore.php       JSONL 风格文件记忆和关键词检索
 │   │   └── MemoryTools.php       remember/recall_memory 工具
@@ -417,6 +423,22 @@ Factory 同时做了三件事：
 - 非 2xx 响应也会增加 calls 和 duration；
 - 没有记录首 Token 延迟，因为没有 streaming。
 
+### 6.5 三种 LLM API 的代码边界
+
+当前 `LlmClient` **只实现 OpenAI-compatible Chat Completions**：
+
+- 固定调用 `/chat/completions`；
+- 输入是 `messages[]`；
+- 输出读取 `choices[0].message`；
+- 工具使用 OpenAI Chat 的 `tools[].function / tool_calls / role=tool` 结构；
+- 多轮历史由 `AgentSession` 在 PHP 进程内保存并重发。
+
+分享文档新增的 Anthropic Messages 和 OpenAI Responses 属于协议讲解，不应说成当前仓库已经实现：
+
+- Anthropic Messages 需要顶层 `system`、typed content blocks、`tool_use/tool_result` 转换和供应商 Header；
+- Responses 需要 `input/output Items`、`previous_response_id` 或 Conversation、typed streaming events 和不同的 Tool Item 映射；
+- 若未来真正支持三种协议，应先抽象统一的 LLM gateway/message model，而不是在 `LlmClient::complete()` 内继续堆条件分支。
+
 ## 7. Tool 系统
 
 ### 7.1 `Tool` 与 `CallableTool`
@@ -568,7 +590,7 @@ if (
 - `--no-shell` 不注册命令工具；
 - 非交互输入默认拒绝，除非 `--yes`。
 
-## 9. 两种 Agent 控制器
+## 9. Agent 控制器与 Sub-agent
 
 ### 9.1 `AgentLoop`
 
@@ -625,6 +647,33 @@ AgentSession    → maxStepsPerTurn
 ### 9.4 当前重复代码
 
 两个类的 tool-call 解码和循环主体高度相似。教学上有利于看清“无状态任务”和“有状态会话”的差别；生产重构时可以抽取共享的 step runner。
+
+### 9.5 `SubAgentManager`
+
+`SubAgentManager` 不新增一套远程服务，而是向父 `ToolRegistry` 注册 `delegate_task`。父模型决定委派后，runtime 同步创建一个新的 `AgentLoop`：
+
+```text
+父 Agent messages
+  → delegate_task(task, mode, minimal context)
+  → 新建 child ToolRegistry
+  → 新建 child AgentLoop / child messages
+  → 子 Agent 调用受限工具
+  → 只把最终 result 返回父 Agent
+```
+
+隔离和限制：
+
+- 子 Agent 与父 Agent 复用 `LlmClient`，所以 Token 指标和日志统一累计；
+- 子 Agent 有独立的 `messages`，看不到父会话的完整历史；
+- `research` 注册 list/read/search，不注册 write/edit/Shell；
+- `workspace` 增加 write/edit，但仍不注册 Shell；
+- child registry 不包含 `delegate_task`，因此不能递归产生孙 Agent；
+- `SUBAGENT_MAX_STEPS` 限制单个子任务轮数；
+- `SUBAGENT_MAX_INVOCATIONS` 限制父会话总委派次数；
+- `SUBAGENT_MAX_RESULT_CHARS` 限制返回父上下文的结果体积；
+- `AgentLoop::purposePrefix` 把子调用记录为 `subagent.n.step.m`。
+
+当前调用是同步的：父 Agent 在子 Agent 返回前不会继续执行。这已经能演示 Context 隔离和权限收窄，但不等于并行 multi-agent runtime。
 
 ## 10. Context Engineering 的代码实现
 
@@ -795,7 +844,7 @@ Skill 本身不会自动写文件，也不会自动执行步骤。
 
 ## 13. MCP
 
-### 13.1 Client 启动过程
+### 13.1 stdio Client 启动过程
 
 `McpClient` 用 `proc_open()` 启动子进程：
 
@@ -812,7 +861,32 @@ initialize request
 notifications/initialized notification
 ```
 
-### 13.2 把远程工具接入本地 Registry
+### 13.2 Streamable HTTP Client
+
+`HttpMcpClient` 连接独立 HTTP MCP Server，不启动子进程：
+
+```text
+POST /mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 协商版本
+Mcp-Session-Id: Server 返回时继续携带
+自定义认证 Header: 只记录名称，不记录值
+```
+
+构造函数同样执行 `initialize` 和 `notifications/initialized`。响应既可直接是 JSON-RPC JSON，也可由 `text/event-stream` 中的 `data:` event 承载。当前实现会等待完整 HTTP body 后解析，不是增量 SSE consumer。
+
+`SaloraMcpConnector` 读取 `SALORA_MCP_*`：
+
+1. `SALORA_MCP_ENABLED=1` 时才连接；
+2. 从被 Git 忽略的 `.env` 读取短期 CRM JWT；
+3. 以 `X-CRM-Authorization: Bearer ...` 注入 MCP HTTP Header；
+4. 调用 `tools/list` 并注册本地 `mcp_salora_*` 工具；
+5. Header 值不会写入 `mcp.http.request` 日志。
+
+远端 Salora Tool name 含 `.`，而 OpenAI-compatible function name 通常只接受字母、数字、下划线和连字符，因此 Client 把其他字符转为 `_`，但 `tools/call` 时仍使用原始远端名称。
+
+### 13.3 把远程工具接入本地 Registry
 
 `registerTools()`：
 
@@ -824,7 +898,7 @@ notifications/initialized notification
 
 因此对 AgentLoop 来说，MCP 工具和 PHP 本地工具没有区别，最后都从 `ToolRegistry::schemas()` 发给模型、从 `ToolRegistry::execute()` 调用。
 
-### 13.3 Schema 归一化
+### 13.4 Schema 归一化
 
 严格 API 要求 object schema 的空 `properties` 编码成：
 
@@ -840,7 +914,7 @@ notifications/initialized notification
 
 `normalizeSchema()` 把 PHP 空数组替换成 `stdClass`，确保 `json_encode()` 输出空对象。这是 PHP 类型系统和 JSON Schema 之间一个很适合分享的工程细节。
 
-### 13.4 教学 MCP Server
+### 13.5 教学 MCP Server
 
 `mcp/snake_server.php` 暴露两个工具：
 
@@ -849,15 +923,39 @@ notifications/initialized notification
 
 这展示了 MCP 的真实价值：**Agent Client 不必硬编码每一种外部工具的协议和 schema，Server 通过标准协议自行声明。**
 
-### 13.5 当前 MCP 子集和限制
+### 13.6 Salora HTTP API Adapter
 
-- 仅 stdio，不支持 HTTP transport；
-- 一行一个 JSON-RPC message；
+`/Users/workspace-lb/crm-salora-mcp-server` 是独立 Streamable HTTP Server。它不开放通用 URL，而是从生成 Catalog 注册经过审计的 read-only Tool：
+
+```text
+Tool name + inputSchema
+  → Catalog registry 中的固定 method/path/apiVersion
+  → MCP Header 中的当前用户 CRM JWT
+  → 原 CRM HTTP API
+  → content + structuredContent
+```
+
+本次使用用户提供的本地 CRM host `http://localhost:18080/api/`，在端口 3001 启动 MCP Server，并通过 `salora.salesLeadsClientList` 完成真实联调。JWT 只存在于本地 `.env` 和 MCP 请求 Header，不进入 Tool arguments。
+
+案例 OpenAPI Catalog 覆盖 76 个 operation 和 220 个 schema，但当前源码只发布 `salora.salesLeadsClientList` 与 `salora.salesDashboardSectionPerformance` 两个 Tool。其余 API 在构建阶段按权限审计、Schema 和发布状态排除。
+
+用户原始 curl 对应的 `memberAccountType/list` 没有出现在当前发布 Catalog 中，所以 Agent 不能通过猜测 Tool 名访问它。新增 API 必须经过 API Catalog、Schema、allowlist，以及 authentication、portal/role、operation、data/object、field 五层权限审计。
+
+关联设计：
+
+- `/Users/workspace-lb/TMGM-CRM-Back-End-update/docs/crmcn-12269/01-crmcn-12455-api-to-ai-tool-mcp-poc-design.md`
+- `/Users/workspace-lb/TMGM-CRM-Back-End-update/docs/crmcn-12269/02-crmcn-12467-salora-api-permission-audit.md`
+
+### 13.7 当前 MCP 子集和限制
+
+- stdio transport 仍是一行一个 JSON-RPC message；
+- HTTP transport 支持 JSON 和 SSE envelope，但不会边到达边消费事件；
 - 请求串行，一次等待一个响应；
-- 固定 30 秒读超时；
+- stdio 固定 30 秒读超时，HTTP timeout 由环境变量配置；
 - 没有处理 Server 主动请求和复杂异步通知；
 - 只实现 initialize 和 Tools；
 - 没有 Roots、Resources、Prompts、Sampling 等；
+- 没有 OAuth discovery、动态 token refresh、多用户 session binding 或 credential broker；
 - MCP 只标准化连接，不自动提供权限和安全保证。
 
 ## 14. 交互式 CLI
@@ -1014,7 +1112,9 @@ Finalizer 汇总 plan 和各 Executor 文本结果
 - WorkspaceTools；
 - MemoryTools；
 - SkillCatalog；
-- MCP Client；
+- stdio MCP Client；
+- 可选 Salora Streamable HTTP MCP Client；
+- SubAgentManager；
 - ContextManager；
 - 启动前 Memory recall；
 - LLM 累计指标。
@@ -1155,6 +1255,15 @@ APP_TIMEZONE              日志与 Memory 时区
 AGENT_TRACE               是否在 stderr 打印完整事件
 CONTEXT_TOKEN_BUDGET      自动压缩预算
 MAX_OLD_TOOL_CHARS        旧工具结果清理阈值
+SUBAGENT_MAX_STEPS        单个 Sub-agent 最大 Agent step
+SUBAGENT_MAX_INVOCATIONS  父会话最多同步委派次数
+SUBAGENT_MAX_RESULT_CHARS 返回父 Context 的最大字符数
+
+SALORA_MCP_ENABLED        是否连接 Salora HTTP MCP
+SALORA_MCP_URL            Streamable HTTP endpoint
+SALORA_MCP_TOKEN_HEADER   用户 CRM JWT 所在 Header
+SALORA_MCP_TOKEN          本地短期 JWT；禁止提交
+SALORA_MCP_TIMEOUT        HTTP MCP 请求超时
 ```
 
 当前 `.env.example` 主要使用 `LLM_*` 作为 cloud 配置；代码额外支持独立 `CLOUD_LLM_*`，便于未来同时保留一套 default 和一套 cloud。
@@ -1177,10 +1286,12 @@ php tests/run.php
 - 文件写入和读取；
 - `..` 目录穿越拒绝；
 - 搜索、精确编辑、命令执行；
+- Sub-agent 只读工具收窄和 `delegate_task` Schema；
 - Skill 元数据和按需正文；
 - Memory 跨实例检索；
 - 旧大工具输出清理；
-- MCP 工具发现、空 object schema 和 HTML 验证。
+- stdio MCP 工具发现、空 object schema 和 HTML 验证；
+- HTTP MCP 非法 transport 拒绝。
 
 测试方式是一个自制 `$test()` + `$assert()` runner，没有 PHPUnit。
 
@@ -1191,6 +1302,8 @@ php tests/run.php
 - Context LLM 摘要路径；
 - LLM HTTP 错误、超时和非 JSON；
 - MCP 超时、子进程异常和错误响应；
+- HTTP MCP JSON/SSE response、Session ID 和认证 Header 的自动化 mock Server 测试；
+- Sub-agent 的 mock LLM 完整多步状态机、并行和取消；
 - symlink 边界；
 - run_command 超时后的子进程树；
 - 多轮 CLI 的自动化端到端测试；
@@ -1208,6 +1321,9 @@ php tests/run.php
 - 命令有 1~600 秒超时；
 - 命令输出会截断；
 - Agent 循环有最大 step；
+- Sub-agent 有调用次数、step、结果长度和无递归限制；
+- research Sub-agent 不注册写入/编辑/Shell，workspace Sub-agent 也不注册 Shell；
+- Salora CRM JWT 不属于 Tool 参数，HTTP MCP 日志只记录 Header 名；
 - MCP HTML validator 也检查相对路径。
 
 ### 19.2 软约束
@@ -1348,11 +1464,14 @@ ProcessRunner
 1. `bin/05_modern_agent.php`
 2. `src/Skills/SkillCatalog.php`
 3. `src/Mcp/McpClient.php`
-4. `mcp/snake_server.php`
-5. `src/Memory/MemoryStore.php`
-6. `src/Context/ContextManager.php`
+4. `src/Mcp/HttpMcpClient.php`
+5. `src/Mcp/SaloraMcpConnector.php`
+6. `mcp/snake_server.php`
+7. `src/Agent/SubAgentManager.php`
+8. `src/Memory/MemoryStore.php`
+9. `src/Context/ContextManager.php`
 
-目标：能说清 MCP、Skill、Memory、Context 各解决不同问题，不把它们混为一谈。
+目标：能说清 stdio/HTTP MCP、Skill、Memory、Context 和 Sub-agent 各解决不同问题，不把它们混为一谈。
 
 ### 第四遍：看产品化入口
 

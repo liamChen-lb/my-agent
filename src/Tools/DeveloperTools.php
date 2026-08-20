@@ -17,6 +17,7 @@ final class DeveloperTools
         string $root,
         callable $approveCommand,
         bool $shellEnabled = true,
+        bool $editEnabled = true,
     ): void {
         $root = rtrim($root, DIRECTORY_SEPARATOR);
 
@@ -60,51 +61,53 @@ final class DeveloperTools
             },
         ));
 
-        $registry->register(new CallableTool(
-            'edit_file',
-            '对工作区文本文件执行一次精确字符串替换。old_string 必须恰好出现一次，避免误改。',
-            [
-                'type' => 'object',
-                'properties' => [
-                    'path' => ['type' => 'string', 'description' => '相对工作区文件路径'],
-                    'old_string' => ['type' => 'string', 'description' => '要替换的完整原文'],
-                    'new_string' => ['type' => 'string', 'description' => '替换后的完整文本，可为空'],
+        if ($editEnabled) {
+            $registry->register(new CallableTool(
+                'edit_file',
+                '对工作区文本文件执行一次精确字符串替换。old_string 必须恰好出现一次，避免误改。',
+                [
+                    'type' => 'object',
+                    'properties' => [
+                        'path' => ['type' => 'string', 'description' => '相对工作区文件路径'],
+                        'old_string' => ['type' => 'string', 'description' => '要替换的完整原文'],
+                        'new_string' => ['type' => 'string', 'description' => '替换后的完整文本，可为空'],
+                    ],
+                    'required' => ['path', 'old_string', 'new_string'],
+                    'additionalProperties' => false,
                 ],
-                'required' => ['path', 'old_string', 'new_string'],
-                'additionalProperties' => false,
-            ],
-            static function (array $arguments) use ($root): array {
-                $file = WorkspaceTools::safePath($root, self::requiredString($arguments, 'path'));
-                if (!is_file($file)) {
-                    throw new \RuntimeException('文件不存在');
-                }
-                $content = file_get_contents($file);
-                if ($content === false) {
-                    throw new \RuntimeException('读取文件失败');
-                }
+                static function (array $arguments) use ($root): array {
+                    $file = WorkspaceTools::safePath($root, self::requiredString($arguments, 'path'));
+                    if (!is_file($file)) {
+                        throw new \RuntimeException('文件不存在');
+                    }
+                    $content = file_get_contents($file);
+                    if ($content === false) {
+                        throw new \RuntimeException('读取文件失败');
+                    }
 
-                $old = self::requiredString($arguments, 'old_string');
-                $new = $arguments['new_string'] ?? null;
-                if (!is_string($new)) {
-                    throw new \InvalidArgumentException('参数 new_string 必须是字符串');
-                }
-                $occurrences = substr_count($content, $old);
-                if ($occurrences !== 1) {
-                    throw new \RuntimeException("old_string 应恰好出现一次，实际出现 {$occurrences} 次");
-                }
+                    $old = self::requiredString($arguments, 'old_string');
+                    $new = $arguments['new_string'] ?? null;
+                    if (!is_string($new)) {
+                        throw new \InvalidArgumentException('参数 new_string 必须是字符串');
+                    }
+                    $occurrences = substr_count($content, $old);
+                    if ($occurrences !== 1) {
+                        throw new \RuntimeException("old_string 应恰好出现一次，实际出现 {$occurrences} 次");
+                    }
 
-                $updated = str_replace($old, $new, $content);
-                if (file_put_contents($file, $updated, LOCK_EX) === false) {
-                    throw new \RuntimeException('写入文件失败');
-                }
+                    $updated = str_replace($old, $new, $content);
+                    if (file_put_contents($file, $updated, LOCK_EX) === false) {
+                        throw new \RuntimeException('写入文件失败');
+                    }
 
-                return [
-                    'ok' => true,
-                    'path' => ltrim(substr($file, strlen($root)), DIRECTORY_SEPARATOR),
-                    'bytes' => strlen($updated),
-                ];
-            },
-        ));
+                    return [
+                        'ok' => true,
+                        'path' => ltrim(substr($file, strlen($root)), DIRECTORY_SEPARATOR),
+                        'bytes' => strlen($updated),
+                    ];
+                },
+            ));
+        }
 
         if (!$shellEnabled) {
             return;

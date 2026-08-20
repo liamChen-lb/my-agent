@@ -15,7 +15,14 @@ final class AgentLoop
         private readonly ToolRegistry $tools,
         private readonly ?ContextManager $contextManager = null,
         private readonly int $maxSteps = 12,
+        private readonly string $purposePrefix = 'agent.step',
     ) {
+        if ($this->maxSteps < 1) {
+            throw new \InvalidArgumentException('Agent maxSteps 必须大于 0');
+        }
+        if ($this->purposePrefix === '') {
+            throw new \InvalidArgumentException('Agent purposePrefix 不能为空');
+        }
     }
 
     public function run(string $task, string $systemPrompt): string
@@ -35,7 +42,7 @@ final class AgentLoop
                 $messages,
                 $this->tools->schemas(),
                 [],
-                "agent.step.{$step}",
+                "{$this->purposePrefix}.{$step}",
             );
             $messages[] = $assistant;
 

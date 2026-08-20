@@ -6,7 +6,7 @@ namespace DemoAgent\Tools;
 
 final class WorkspaceTools
 {
-    public static function register(ToolRegistry $registry, string $root): void
+    public static function register(ToolRegistry $registry, string $root, bool $writeEnabled = true): void
     {
         $root = rtrim($root, DIRECTORY_SEPARATOR);
 
@@ -21,7 +21,8 @@ final class WorkspaceTools
                 'additionalProperties' => false,
             ],
             static function (array $arguments) use ($root): array {
-                $directory = self::safePath($root, (string) ($arguments['path'] ?? '.'));
+                $relative = trim((string) ($arguments['path'] ?? '.'));
+                $directory = self::safePath($root, $relative === '' ? '.' : $relative);
                 if (!is_dir($directory)) {
                     throw new \RuntimeException('目录不存在');
                 }
@@ -66,6 +67,10 @@ final class WorkspaceTools
                 return $content;
             },
         ));
+
+        if (!$writeEnabled) {
+            return;
+        }
 
         $registry->register(new CallableTool(
             'write_file',

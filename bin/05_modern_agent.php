@@ -5,10 +5,12 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/bootstrap.php';
 
 use DemoAgent\Agent\AgentLoop;
+use DemoAgent\Agent\SubAgentManager;
 use DemoAgent\Cli\DemoOptions;
 use DemoAgent\Context\ContextManager;
 use DemoAgent\Llm\LlmFactory;
 use DemoAgent\Mcp\McpClient;
+use DemoAgent\Mcp\SaloraMcpConnector;
 use DemoAgent\Memory\MemoryStore;
 use DemoAgent\Memory\MemoryTools;
 use DemoAgent\Skills\SkillCatalog;
@@ -40,6 +42,15 @@ try {
         project_path(),
     );
     $mcp->registerTools($tools);
+    $saloraMcp = SaloraMcpConnector::registerFromEnvironment($tools, $llm->logger());
+    $subAgents = new SubAgentManager(
+        $llm,
+        $workspace,
+        maxSteps: (int) (env('SUBAGENT_MAX_STEPS', '6') ?? '6'),
+        maxInvocations: (int) (env('SUBAGENT_MAX_INVOCATIONS', '4') ?? '4'),
+        maxResultChars: (int) (env('SUBAGENT_MAX_RESULT_CHARS', '12000') ?? '12000'),
+    );
+    $subAgents->registerTool($tools);
 
     $context = new ContextManager(
         $llm,
@@ -59,6 +70,7 @@ try {
 4. memory 位于上下文窗口之外。只把跨任务仍有价值的信息写入长期记忆。
 5. 写入文件后调用适当工具验证；失败则根据 observation 修复。
 6. 尽量保持静态指令在前、动态结果在后，以利前缀缓存。
+7. 边界清晰且可独立完成的研究或文件任务可交给 delegate_task；只传最小必要背景，不委派简单任务。
 PROMPT;
     $systemPrompt .= "\n\n" . $skills->metadataPrompt();
     if ($recalled !== []) {

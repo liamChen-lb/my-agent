@@ -1,10 +1,10 @@
 # LLM & Agent：从“文字接龙”到能做事的软件系统
 
 > 面向后端、前端、测试及其他研发岗位  
-> 内容基线：2026 年 7 月  
+> 内容基线：2026 年 8 月
 > 学习路径：What（是什么）→ Why（为什么）→ How（怎样用）
 >
-> 简介：从 LLM 的能力边界出发，拆解工具调用、上下文工程、MCP、Skills 与 Memory，并用 PHP 从零实现可交互 Agent，对比云端与本地模型的实际表现。
+> 简介：从 LLM 的能力边界出发，对比 Chat Completions、Anthropic Messages 与 Responses，拆解上下文工程、MCP、Skills、Memory 和 Sub-agent，并用 PHP 从零实现可交互 Agent。
 
 ## 分享全局思维导图
 
@@ -21,6 +21,9 @@ mindmap
       有限上下文与成本
         Context Window
         Token 与 Prompt Cache
+      API 状态归属
+        Chat 与 Messages 客户端历史
+        Responses 可选服务端状态
     Agent 系统层 补偿控制与执行
       Context Engineering
         上下文选择与装配
@@ -29,10 +32,12 @@ mindmap
       工具运行时
         Function Calling
         MCP 与 Skills
+        HTTP API Tool 化
         ACI
       控制循环
         ReAct
         Plan-and-Execute
+        Sub-agent
         Multi-Agent
       系统工程
         安全与权限
@@ -46,6 +51,7 @@ mindmap
         三种共存运行方式
       案例与模型对比
         贪吃蛇完整案例
+        Salora CRM MCP
         云端与 Ollama
       生产落地检查
         正确性与成本
@@ -59,10 +65,11 @@ mindmap
 听完后，参与者应能回答：
 
 1. LLM 到底做了什么，哪些能力属于模型，哪些属于外围软件；
-2. 为什么会出现 Prompt、RAG、Context Engineering、Memory、Function Calling、MCP 和 Skills；
-3. Agent 如何把模型输出变成真实动作，又如何把动作结果送回模型；
-4. 如何读懂一次 Agent 的完整请求、响应、工具调用和上下文压缩；
-5. 如何用普通 PHP 实现一个具备现代核心部件的 Agent。
+2. Chat Completions、Anthropic Messages 与 Responses 在消息结构和状态管理上有什么区别；
+3. 为什么会出现 Prompt、RAG、Context Engineering、Memory、Function Calling、MCP 和 Skills；
+4. Agent 如何把模型输出变成真实动作，又如何通过 MCP 安全调用既有 HTTP API；
+5. 如何读懂一次 Agent 的请求、响应、Sub-agent 委派、工具调用和上下文压缩；
+6. 如何用普通 PHP 实现一个具备现代核心部件的 Agent。
 
 本分享使用两个便于理解但必须加限定的心智模型：
 
@@ -190,7 +197,112 @@ sequenceDiagram
     L-->>A: assistant_2
 ```
 
-### 3.2 Prompt 和 Context 不宜强行二分
+### 3.2 三种 LLM API 协议：Chat Completions、Anthropic Messages 与 Responses
+
+先区分两个容易混在一起的概念：
+
+- **模型推理无状态**：每次生成仍然只依据本次进入 Context Window 的内容，模型参数不会因为一次业务会话而改变；
+- **API/平台是否代管会话状态**：供应商可以在模型外部保存 Response、Conversation 等对象，下次调用时重新装配历史。
+
+因此，Responses API 的“有状态”是服务端 orchestration 能力，不是模型突然拥有了跨请求记忆。
+
+```mermaid
+flowchart TB
+    APP[应用 / Agent]
+    CC[OpenAI Chat Completions<br/>messages]
+    AM[Anthropic Messages<br/>system + messages]
+    RP[OpenAI Responses<br/>input / output Items]
+    CS[(应用保存历史)]
+    RS[(OpenAI 保存 Response / Conversation)]
+    CTX[重建本轮 Active Context]
+    LLM[无状态模型推理]
+
+    APP --> CC
+    APP --> AM
+    APP --> RP
+    CC <--> CS
+    AM <--> CS
+    CS --> CTX
+    RP <--> RS
+    RP -->|也可手工重放 Items| CTX
+    RS -->|previous_response_id / conversation| CTX
+    CTX --> LLM
+```
+
+**OpenAI Chat Completions**
+
+- Endpoint：`POST /v1/chat/completions`；
+- 输入核心是 `messages[]`，常见角色为 `system`、`user`、`assistant`、`tool`；
+- 输出核心位于 `choices[0].message`；
+- 多轮历史通常由应用保存并在下一轮重发；
+- Function Calling 通过 `tools[].function`、assistant `tool_calls` 和 `role=tool` 消息构成闭环；
+- 接口简单、兼容实现多，本项目当前的 `LlmClient` 使用这一协议。
+
+```json
+{
+  "model": "example-model",
+  "messages": [
+    {"role": "system", "content": "回答要准确"},
+    {"role": "user", "content": "第一问"},
+    {"role": "assistant", "content": "第一答"},
+    {"role": "user", "content": "追问"}
+  ],
+  "tools": []
+}
+```
+
+**Anthropic Messages**
+
+- Endpoint：`POST /v1/messages`；
+- `system` 是顶层字段，不是 `messages[]` 中的 `system` role；
+- `messages[]` 主要使用 `user` 和 `assistant`，内容由多个 typed content blocks 组成；
+- Tool Use 使用 assistant `tool_use` block 和后续 user `tool_result` block；
+- 官方将其描述为可用于单次请求或“stateless multi-turn conversations”：应用必须提供前序轮次；
+- 请求还要求 `x-api-key` 和 `anthropic-version` 等供应商 Header。
+
+```json
+{
+  "model": "claude-example",
+  "max_tokens": 1024,
+  "system": "回答要准确",
+  "messages": [
+    {"role": "user", "content": "第一问"},
+    {"role": "assistant", "content": "第一答"},
+    {"role": "user", "content": "追问"}
+  ],
+  "tools": []
+}
+```
+
+**OpenAI Responses**
+
+- Endpoint：`POST /v1/responses`，OpenAI 推荐新项目优先使用；
+- 输入从单一 `messages[]` 演进为字符串或 typed `input` Items；
+- 输出是带 `id`、`status` 和 `output[]` 的 typed Response，message、reasoning、function call、hosted tool trace 可以成为不同 Item；
+- 可继续由客户端手工重放 Items，保持无状态和完整上下文控制；
+- 也可使用 `previous_response_id` 串联 Response，或使用 Conversations API 保存持久 Conversation；
+- 这种服务端状态减少了客户端重复传输历史的网络 payload 和状态管理代码，但不会消除模型侧的历史输入 Token；官方明确说明，链上的历史输入仍会计费；
+- `previous_response_id` 不会自动继承上一轮顶层 `instructions`，稳定指令应按官方语义重新发送；
+- 需要 Zero Data Retention、精确裁剪或自主管理 Context 时，应选择 `store: false` 并显式传递必要 Items。
+
+```json
+{
+  "model": "example-model",
+  "instructions": "回答要准确",
+  "input": "继续解释上一轮",
+  "previous_response_id": "resp_123",
+  "tools": []
+}
+```
+
+选择原则：
+
+1. 需要成熟的 OpenAI-compatible 生态和简单消息模型，可继续使用 Chat Completions；
+2. 直接使用 Claude 原生能力时，应理解 Anthropic content blocks 和 tool use 语义，而不是只替换 URL；
+3. 新建 OpenAI Agent 工作流、需要 hosted tools、typed Items 或服务端 Conversation 时，优先评估 Responses；
+4. “服务端代管历史”换来更小的网络请求和更少的客户端状态代码，同时带来数据保留、供应商绑定、分支/删除控制和审计边界，应显式选择而不是默认依赖。
+
+### 3.3 Prompt 和 Context 不宜强行二分
 
 术语没有全球唯一标准，工程中建议使用以下定义：
 
@@ -201,7 +313,7 @@ sequenceDiagram
 
 “未输入模型的就是 Context、输入模型的就是 Prompt”不是通行定义。外部存储只有被检索并注入后，才成为本次 Active Context。
 
-### 3.3 从 Prompt Engineering 到 Context Engineering
+### 3.4 从 Prompt Engineering 到 Context Engineering
 
 Prompt Engineering 更关注如何表达指令；Context Engineering 覆盖完整信息管线：
 
@@ -222,7 +334,7 @@ flowchart TB
 
 > 在给定成本和窗口约束下，提供最少但高信号、可行动、来源清楚的信息。
 
-### 3.4 RAG 解决什么，不解决什么
+### 3.5 RAG 解决什么，不解决什么
 
 RAG（Retrieval-Augmented Generation）在生成前检索外部资料：
 
@@ -242,7 +354,7 @@ RAG（Retrieval-Augmented Generation）在生成前检索外部资料：
 
 RAG 可以补充新知识和私有知识，但不会自动消除幻觉。错误切分、漏召回、提示注入、过期文档和生成阶段误用证据仍会失败。
 
-### 3.5 Prompt Cache 为什么重要
+### 3.6 Prompt Cache 为什么重要
 
 许多供应商会缓存重复的输入前缀。工程原则：
 
@@ -345,6 +457,17 @@ flowchart TB
 
 多 Agent 并不天然优于单 Agent。任务无法并行、共享状态很重或协调成本高时，一个带好工具的 Agent 可能更可靠。
 
+本项目现在通过 `delegate_task` 实现一个可观察的同步 Sub-agent：
+
+- 父 Agent 只传 `task + mode + 最小必要 context`，不会复制完整会话；
+- 子 Agent 创建独立 `messages`，与父 Agent 的活跃 Context 隔离；
+- `research` 模式只有列目录、读文件和搜索能力；
+- `workspace` 模式可增加写文件和精确编辑，但仍不能运行 Shell；
+- 子工具集不注册 `delegate_task`，从结构上禁止递归委派；
+- `SUBAGENT_MAX_STEPS`、`SUBAGENT_MAX_INVOCATIONS` 和结果长度共同限制成本；
+- 子 Agent 与父 Agent 复用 LLM Client、工作区边界、日志器和 Token 指标，因此调用可统一审计；
+- 当前实现是同步委派，不是并行调度器；它主要演示 Context 隔离、权限收窄和结果压缩。
+
 ---
 
 ## 5. 从输出 Token 到真实动作
@@ -415,6 +538,134 @@ MCP 解决“怎样发现和调用能力”的互操作问题，不负责：
 - 自动完成鉴权和业务授权；
 - 防止数据外泄或危险操作；
 - 替代 Agent loop。
+
+#### 5.3.1 MCP 与三种 LLM API 不在同一层
+
+Chat Completions、Anthropic Messages 和 Responses 是 **Agent Host 调模型**的推理协议；MCP 是 **Agent Host 连接外部工具和数据服务**的集成协议。它们不是四选一，而是可以组合：
+
+```mermaid
+flowchart LR
+    U[用户] --> H[Agent Host / Runtime]
+    H -->|messages| CC[OpenAI Chat Completions]
+    H -->|system + content blocks| AM[Anthropic Messages]
+    H -->|input / output Items| RP[OpenAI Responses]
+    H --> C[MCP Client]
+    C -->|JSON-RPC<br/>tools/list / tools/call| S[MCP Server]
+    S -->|HTTP / SDK / SQL| API[既有业务系统]
+    CC --> H
+    AM --> H
+    RP --> H
+    API --> S
+    S --> C
+```
+
+对比时应抓住四条边界：
+
+1. **调用对象**：LLM API 调模型；MCP 调能力提供方；
+2. **核心载荷**：LLM API 传 Prompt、Messages 或 Items；MCP Tools 传 name、JSON Schema、arguments 和 result；
+3. **状态语义**：Chat Completions/Anthropic Messages 通常由应用重放历史，Responses 可选服务端状态；MCP 是有初始化和能力协商的连接协议，但业务会话和用户身份仍由 Host/Server 设计；
+4. **工具闭环**：模型只生成工具调用意图，Agent Host 执行本地 Tool 或通过 MCP Client 调远端 Tool，再把结果转换回模型协议。
+
+#### 5.3.2 从已有 HTTP API 转成 Agent Tool
+
+“把 API 转成 Tool”不是把 URL 原样交给模型，而是建立受控适配层：
+
+- HTTP `method + path` 转为稳定、语义化的 Tool name；
+- API 业务说明转为 Tool description，帮助模型判断何时调用；
+- query/body 参数转为严格 `inputSchema`，隐藏 token、内部 host 和不可控 Header；
+- API response 转为 Tool `content` 或 `structuredContent`，并设置大小、分页和字段边界；
+- Adapter 在服务端维护 Tool name 到固定 API dispatch entry 的 allowlist，拒绝模型猜测任意路径；
+- 原 API 的认证、操作权限、对象数据范围和字段权限仍是最终安全边界。
+
+这就是 MCP Server 的价值：它把现有 Web API 的“面向前端调用契约”适配成 Agent 可以发现、理解和调用的工具契约，但不应复制一套新的业务权限系统。
+
+#### 5.3.3 Salora CRM MCP Server 案例
+
+本地案例由三个项目共同组成：
+
+- 当前 PHP Agent：`/Users/workspace-llm/my-agent`；
+- Streamable HTTP MCP Server：`/Users/workspace-lb/crm-salora-mcp-server`；
+- RAG + QA Bot / AI Platform 迭代设计：`/Users/workspace-lb/TMGM-CRM-Back-End-update/docs/crmcn-12269`。
+
+其中两份核心设计文档分别回答：
+
+1. `01-crmcn-12455-api-to-ai-tool-mcp-poc-design.md`：HTTP API 怎样演进为前端 Tool Executor、CRM Tools Gateway 和独立 MCP Server；
+2. `02-crmcn-12467-salora-api-permission-audit.md`：为什么“页面能调用”不等于“可以安全开放给 AI”，以及 authentication、portal/role、operation、data/object、field 五层门禁。
+
+12455 给出的不是一次性重写，而是共享同一 API Catalog 的三阶段演进：
+
+1. **Stage 1：前端 Tool Executor**。Salora 浏览器复用当前登录用户 CRM token 和已有 API service，最低成本验证页面助手闭环；这是推荐 POC 路径，仍处于设计/评审状态；
+2. **Stage 2：CRM Tools Gateway**。由 Laravel CRM 提供服务端连续调用和组合能力，需要 delegated credential，并显式补齐绕过原 route 时的权限判断；当前是设计态；
+3. **Stage 3：独立 MCP Server**。面向多 Agent 和多系统提供标准 `tools/list/tools/call`；当前已有两个 read-only Tool 的薄适配 POC。
+
+API Catalog 文档覆盖 76 个 operation 和 220 个 schema，但不是全部发布给模型。当前源码 Catalog 只启用：
+
+- `salora.salesLeadsClientList`；
+- `salora.salesDashboardSectionPerformance`。
+
+其余 operation 因权限审计、Schema 完整度或发布状态未通过而在构建期排除。Catalog 是能力 allowlist，不是第二套 ACL。
+
+Salora MCP Server 是一个无状态 Streamable HTTP Gateway：
+
+- Endpoint：`POST /mcp`，健康检查：`GET /healthz`；
+- 通过 `tools/list` 只发布 Catalog allowlist 中的只读工具；
+- 通过 `tools/call` 校验 JSON Schema，再把参数转换为固定 CRM HTTP query/body；
+- 从 MCP 请求 Header `X-CRM-Authorization` 取得当前用户短期 JWT；
+- 下游固定转换成 CRM `Authorization: Bearer ...`；
+- token 不是 Tool 参数，模型不会看到，Server 也不记录；
+- CRM response 进入 `content` 和 `structuredContent`，业务错误标记为 `isError`。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant A as PHP Agent
+    participant L as LLM API
+    participant C as HttpMcpClient
+    participant M as Salora MCP Server
+    participant R as CRM HTTP API
+
+    A->>C: initialize + tools/list
+    C->>M: JSON-RPC over Streamable HTTP
+    M-->>C: allowlisted Tool schemas
+    A->>L: 用户问题 + Tool schemas
+    L-->>A: tool call name + arguments
+    A->>C: 调用本地 mcp_salora_* Tool
+    Note over A,C: JWT 由 Host secret 注入，不进入 Prompt
+    C->>M: tools/call + X-CRM-Authorization
+    M->>R: 固定 method/path + Authorization Bearer
+    R->>R: authentication + portal + operation + data + field
+    R-->>M: CRM response
+    M-->>C: content + structuredContent / isError
+    C-->>A: Tool observation
+    A->>L: 安全裁剪后的 Tool result
+    L-->>A: 最终自然语言回答
+    A-->>U: 回答与来源
+```
+
+用户提供的浏览器请求可安全提取出：
+
+- CRM Base URL：`http://localhost:18080/api/`；
+- API version media type：`application/prs.CRM-Back-End.v2+json`；
+- 认证类型：短期 Bearer JWT；
+- 页面来源：`http://localhost:15173`。
+
+真实 JWT 只写入被 Git 忽略的本地 `.env`，不能进入示例、Prompt、日志或提交。对应本地联调配置：
+
+```dotenv
+SALORA_MCP_ENABLED=1
+SALORA_MCP_URL=http://127.0.0.1:3001/mcp
+SALORA_MCP_TOKEN_HEADER=X-CRM-Authorization
+SALORA_MCP_TOKEN=本地短期JWT
+```
+
+```bash
+cd /Users/workspace-lb/crm-salora-mcp-server
+MCP_PORT=3001 CRM_BASE_URL=http://localhost:18080/api/ npm start
+```
+
+当前 PHP Agent 新增 `HttpMcpClient`，支持 Streamable HTTP 的 JSON 和 SSE 响应，并把远端 Tool name 安全转换为 OpenAI-compatible function name。实际联调已通过 `salora.salesLeadsClientList` 读取本地 CRM，返回 HTTP 200。
+
+必须强调：用户 curl 中的 `memberAccountType/list` 目前不在该 MCP Server 的发布 allowlist 中，因此“连接成功”不等于模型可以调用任意 CRM URL。若要增加此能力，应先补 API Catalog、Tool Schema 和权限审计，再发布新 Tool，而不是开放通用 HTTP 代理。
 
 ### 5.4 Skills 是按需加载的程序性知识
 
@@ -534,7 +785,7 @@ timeline
 3. `bin/02_native_function_call.php`：原生 Function Calling，但只执行一次，说明“工具调用 ≠ Agent loop”；
 4. `bin/03_react_agent.php`：重复“模型决策 → 工具执行 → Observation”；
 5. `bin/04_plan_execute.php`：Planner 拆任务，Executor 分步完成，最后汇总；
-6. `bin/05_modern_agent.php`：Native Tools + MCP + Skills + Memory + Context Compaction；
+6. `bin/05_modern_agent.php`：Native Tools + stdio/HTTP MCP + Skills + Memory + Context Compaction + Sub-agent；
 7. `bin/06_compare_models.php`：让云端与 Ollama 模型执行完全相同的 Agent 任务并统计结果；
 8. `bin/chat.php` / `bin/agent`：类似 Coding Agent CLI 的多轮终端会话，复用现代 Agent 全部能力；
 9. `examples/snake.html`：可直接打开的单文件贪吃蛇成品，用于无 API 的静态演示。
@@ -553,6 +804,14 @@ LOCAL_LLM_API_KEY=ollama
 LOCAL_LLM_MODEL_ID=qwen3.6:35b
 
 AGENT_TRACE=1
+SUBAGENT_MAX_STEPS=6
+SUBAGENT_MAX_INVOCATIONS=4
+
+# 可选：Salora Streamable HTTP MCP
+SALORA_MCP_ENABLED=0
+SALORA_MCP_URL=http://127.0.0.1:3000/mcp
+SALORA_MCP_TOKEN_HEADER=X-CRM-Authorization
+SALORA_MCP_TOKEN=本地短期JWT
 ```
 
 只要服务兼容 OpenAI Chat Completions，便可替换 Base URL 和模型。`LLM_MODEL` 仍作为旧配置别名兼容，但优先使用 `LLM_MODEL_ID`。不同厂商及本地模型对 `tool_calls` 的细节支持仍需实测。`bin/00_chat.php` 至 `bin/05_modern_agent.php` 都支持 `--profile=default|cloud|local`；不传时保持原行为，读取 `LLM_*` 默认配置。
@@ -573,7 +832,7 @@ php bin/05_modern_agent.php --profile=local "创建并验证一个单文件 HTML
 
 **版本二：当前项目内的交互式 Agent**
 
-在本仓库启动，多轮 messages、Tools、MCP、Skills、Memory、Context Compaction 和 JSONL 日志都持续有效：
+在本仓库启动，多轮 messages、Tools、MCP、Skills、Memory、Context Compaction、Sub-agent 和 JSONL 日志都持续有效：
 
 ```bash
 cd /Users/workspace-llm/my-agent
@@ -603,7 +862,7 @@ my-agent
 
 LLM 配置始终读取 Agent 仓库自己的 `.env`，不会把目标项目的 `.env` 当成模型密钥配置。默认使用云端 profile；只有性能对比时显式运行 `my-agent --profile=local`。
 
-项目级 CLI 提供 `search_files`、`read_file`、`write_file`、`edit_file` 和 `run_command`，可完成基本代码搜索、最小编辑、测试、格式化和构建。Shell 命令默认逐次显示并请求确认；`--no-shell` 可完全禁用，`--yes` 会自动批准，仅应在隔离环境中使用。
+项目级 CLI 提供 `search_files`、`read_file`、`write_file`、`edit_file`、`run_command` 和 `delegate_task`。Sub-agent 的 `research` 模式只读，`workspace` 模式可修改文件但不能执行 Shell；父 Agent 的 Shell 命令仍默认逐次显示并请求确认。`--no-shell` 可完全禁用父 Agent 命令工具，`--yes` 会自动批准，仅应在隔离环境中使用。
 
 终端内置命令：
 
@@ -644,6 +903,8 @@ tail -f "$(ls -t var/logs/*.jsonl | head -1)"
 - `llm.response`：模型原始响应和 usage；
 - `tool.request / tool.response`：模型“想做什么”与程序“实际做了什么”；
 - `mcp.request / mcp.response`：MCP 只是另一层协议消息；
+- `mcp.http.request / mcp.http.response`：Streamable HTTP MCP 请求和响应，日志只记录自定义 Header 名，不记录 JWT 值；
+- `subagent.started / subagent.completed / subagent.failed`：父 Agent 的委派边界、模式、结果长度与失败原因；
 - `context.tool_results_cleared / context.compacted`：上下文何时被清理或摘要。
 
 为保护密钥，Authorization Header 从不写入日志；但业务 Prompt 和工具数据会记录，生产环境必须做脱敏、访问控制和保留期限管理。
@@ -691,7 +952,7 @@ Modern Agent 生成的新文件位于 `var/workspaces/modern/snake.html`。
 php tests/run.php
 ```
 
-测试不调用外部 LLM，覆盖工作区边界、Skill 渐进加载、外部 Memory、旧工具输出清理、MCP 工具发现和贪吃蛇验收。
+默认测试不调用外部 LLM，覆盖工作区边界、Sub-agent 权限收窄和工具 Schema、Skill 渐进加载、外部 Memory、旧工具输出清理、MCP 工具发现、HTTP transport 参数校验和贪吃蛇验收。另用云端模型完成了只读 Sub-agent 实际调用，并用本地 CRM JWT 完成了 Salora MCP Tool 联调。
 
 ### 8.6 云端模型与本地模型对比
 
@@ -839,16 +1100,16 @@ Ollama 报告该本地模型为 36.0B 参数、GGUF Q4_K_M、23 GB，架构族�
 
 1. **5 分钟：祛魅**  
    用“参数化知识快照 + 逐 Token 生成”建立心智模型，同时讲清限定。
-2. **10 分钟：为什么需要外围工程**  
-   无状态、多轮历史、RAG、Token 成本、Prompt Cache。
-3. **12 分钟：Agent 是怎样动手的**  
-   从 XML 工具标签演进到 Native Function Calling，现场看请求和响应。
-4. **12 分钟：Agent loop 与规划**  
-   演示 ReAct 文件任务，再对比 Plan-and-Execute。
-5. **12 分钟：现代 Context Engineering**  
-   Tool clearing、摘要、Memory、Sub-agent、MCP、Skills。
-6. **6 分钟：贪吃蛇完整案例**  
-   `load_skill → MCP spec → write_file → MCP validate → 浏览器打开`。
+2. **12 分钟：无状态与三种 LLM API**
+   对比 Chat Completions、Anthropic Messages、Responses 的消息结构、状态归属和工具语义。
+3. **10 分钟：从模型输出到业务 Tool**
+   Native Function Calling、MCP Tools，以及 Salora HTTP API → MCP Tool → CRM 权限链。
+4. **10 分钟：Agent loop、规划与委派**
+   对比 ReAct、Plan-and-Execute 和隔离 Context 的 Sub-agent。
+5. **10 分钟：现代 Context Engineering**
+   RAG、Tool clearing、摘要、Memory、Prompt Cache 和 Skills。
+6. **10 分钟：两个完整演示**
+   Salora MCP 只读查询；`load_skill → MCP spec → write_file → MCP validate → 浏览器打开`。
 7. **3 分钟：安全、成本与结论**。
 
 可用三句话收尾：
@@ -885,22 +1146,29 @@ Ollama 报告该本地模型为 36.0B 参数、GGUF Q4_K_M、23 GB，架构族�
 
 ### 协议、Skills 与缓存
 
-14. Model Context Protocol Specification: https://modelcontextprotocol.io/specification/2025-11-25
-15. Agent Skills 开放规范: https://agentskills.io/home
-16. Anthropic, *Equipping agents for the real world with Agent Skills*: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
-17. OpenAI, *Prompt Caching*: https://developers.openai.com/api/docs/guides/prompt-caching
+14. OpenAI, *Chat Completions API Reference*: https://platform.openai.com/docs/api-reference/chat
+15. Anthropic, *Messages API Reference*: https://docs.anthropic.com/en/api/messages
+16. OpenAI, *Migrate to the Responses API*: https://developers.openai.com/api/docs/guides/migrate-to-responses
+17. OpenAI, *Conversation state*: https://developers.openai.com/api/docs/guides/conversation-state
+18. Model Context Protocol, *Tools Specification*: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+19. Model Context Protocol Specification: https://modelcontextprotocol.io/specification/2025-11-25
+20. CRMCN-12455, *Salora API 转 AI Tool / MCP 技术方案*: https://thebidgroup.atlassian.net/browse/CRMCN-12455
+21. CRMCN-12467, *Salora API 操作权限与数据权限审计*: https://thebidgroup.atlassian.net/browse/CRMCN-12467
+22. Agent Skills 开放规范: https://agentskills.io/home
+23. Anthropic, *Equipping agents for the real world with Agent Skills*: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+24. OpenAI, *Prompt Caching*: https://developers.openai.com/api/docs/guides/prompt-caching
 
 ### 可继续参考的开源实现
 
-18. Datawhale, *hello-agents*: https://github.com/datawhalechina/hello-agents
-19. *ai-agents-from-zero*: https://github.com/didilili/ai-agents-from-zero
-20. *learn-claude-code*: https://github.com/shareAI-lab/learn-claude-code
-21. Anthropic, *claude-code*: https://github.com/anthropics/claude-code
-22. *free-claude-code*: https://github.com/Alishahryar1/free-claude-code
-23. Petroni et al., *Language Models as Knowledge Bases?* (2019): https://arxiv.org/abs/1909.01066
-24. OpenAI, *Function Calling*: https://platform.openai.com/docs/guides/function-calling
-25. Anthropic, *Building effective agents* (2024): https://www.anthropic.com/engineering/building-effective-agents
-26. Packer et al., *MemGPT: Towards LLMs as Operating Systems* (2023): https://arxiv.org/abs/2310.08560
-27. Anthropic, *How we built our multi-agent research system* (2025): https://www.anthropic.com/engineering/multi-agent-research-system
+25. Datawhale, *hello-agents*: https://github.com/datawhalechina/hello-agents
+26. *ai-agents-from-zero*: https://github.com/didilili/ai-agents-from-zero
+27. *learn-claude-code*: https://github.com/shareAI-lab/learn-claude-code
+28. Anthropic, *claude-code*: https://github.com/anthropics/claude-code
+29. *free-claude-code*: https://github.com/Alishahryar1/free-claude-code
+30. Petroni et al., *Language Models as Knowledge Bases?* (2019): https://arxiv.org/abs/1909.01066
+31. OpenAI, *Function Calling*: https://platform.openai.com/docs/guides/function-calling
+32. Anthropic, *Building effective agents* (2024): https://www.anthropic.com/engineering/building-effective-agents
+33. Packer et al., *MemGPT: Towards LLMs as Operating Systems* (2023): https://arxiv.org/abs/2310.08560
+34. Anthropic, *How we built our multi-agent research system* (2025): https://www.anthropic.com/engineering/multi-agent-research-system
 
 论文版本、API 行为和价格会变化；正式分享前应再次检查链接、修订日期和供应商文档。
